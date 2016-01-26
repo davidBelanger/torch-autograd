@@ -1548,19 +1548,20 @@ local tests = {
       --This implements a very simple example of the concepts in:
       --Maclaurin, Duvenaud, and Adams. "Gradient-based Hyperparameter Optimization through Reversible Learning."
       --We learn a linear regression model with SGD, and differentiate the test set performance of the model with respect to the learning rate used at train time
-      --Ideally this would be used to learn the learning rate using gradient descent. This test is more simple. 
-      --It just evaluates the gradient of the loss with respect to the learningRate for a few different learning rate values. 
-      --Also, Maclaurin et al. use SGD with momentum, but this test uses simple SGD. 
+      --Ideally this would be used to learn the learning rate using gradient descent. This test is more simple.
+      --It just evaluates the gradient of the loss with respect to the learningRate for a few different learning rate values.
+      --Also, Maclaurin et al. use SGD with momentum, but this test uses simple SGD.
 
       -- define trainable parameters:
-      local numFeatures = 10
-      local numOutputs = 3
-      local numSamples = 250
-      local numEpochs = 10
+      local numFeatures = 5
+      local numOutputs = 2
+      local numSamples = 150
+      local numEpochs = 1
+      local useMomentum = true
 
       --this sets up the true model from which the data is drawn
       local trueParams = {
-         W = torch.randn(numFeatures,numOutputs),
+         W = torch.randn(numFeatures,numOutputs):mul(2.0),
          b = torch.randn(numOutputs)
       }
 
@@ -1578,7 +1579,7 @@ local tests = {
       local testSet = genDataset()
 
 
-      -- define loss for linear regression model 
+      -- define loss for linear regression model
       local linearRegressionLoss = function(params, x, y)
          local yhat = x*params.W + params.b
          local residual = y - yhat
@@ -1591,28 +1592,42 @@ local tests = {
 
 
       --we learn the regression parameters using SGD with a fixed step size
-      function gradientUpdate(metaParams,params,grads)
-         torch.add(params.W,params.W,-metaParams.learningRate,grads.W)
-         torch.add(params.b,params.b,-metaParams.learningRate,grads.b)
+      function gradientUpdate(hyperParams,params,grads,velocity)
+          for k,_ in pairs(params) do
+            grads[k] = grads[k] + hyperParams.lambda*params[k] --l2 regularization with weight lambda
+            if(useMomentum) then
+               velocity[k] = hyperParams.gamma*velocity[k] + (1 - hyperParams.gamma)*grads[k]
+                params[k] = params[k] - hyperParams.learningRate * velocity[k]
+         else
+               params[k] = params[k] - hyperParams.learningRate * grads[k]
+            end 
+          end
       end
 
-      --this initializes the params that are optimized by learning. 
+      --this initializes the params that are optimized by learning.
       function getInitParams()
          local p =  {
-            W = torch.zero(torch.Tensor(numFeatures,numOutputs)),
-            b = torch.zero(torch.Tensor(numOutputs))
+            W = torch.zero(torch.Tensor.new(numFeatures,numOutputs)),
+            b = torch.zero(torch.Tensor.new(numOutputs))
          }
          return p
       end
 
       --this learns a regression model on the train set and evaluates its squared loss on the test set
-      --its behavior depends on the value of learningRate in metaParams
-      function learn(metaParams)
+      --its behavior depends on the value of learningRate in hyperParams
+      function learn(hyperParams, trainingSet, testSet)
          local params = getInitParams()
+         local velocity
+         if(useMomentum) then
+            velocity = getInitParams()
+            for k,v in pairs(velocity) do
+               v = v*0
+            end
+         end
          for epoch = 1,numEpochs do
             for _,sample in ipairs(trainingSet) do
                local grads, loss = dLinearRegressionLoss(params, sample.x, sample.y)
-                gradientUpdate(metaParams,params,grads)
+               gradientUpdate(hyperParams,params,grads,velocity)
             end
          end
 
@@ -1620,24 +1635,53 @@ local tests = {
          local numSamples = #testSet
          for _,sample in ipairs(testSet) do
             local g, tL = dLinearRegressionLoss(params,sample.x,sample.y)
-            torch.add(testLoss,testLoss,tL)
+            testLoss = testLoss + (1/numSamples)*tL
          end
          return testLoss[1]
       end
 
-
       --this is the gradient of the test loss with respect to the learning rate used on the train data
-      local dLearn = autograd(learn)
+      local dLearn = autograd(learn, { inline = false })
 
-      --this just evaluates dLearn for a few choices of the learning rate. Eventually, we would like to learn the learningRate with gradient descent.
-      for _,lr in ipairs({0.001,0.01,0.1}) do
+      --these are the hyper parameters that we will learn
+      local hyperParamsToUpdate = {'lambda',"learningRate"}
 
-         --this just evaluates the 'learn' function directly, in order to demonstrate that this code path works
-         local testLoss1 = learn({learningRate = lr})
+      --these control the learning of the hyperparameters
+      local hyperHyperParams = {learningRate = 0.05, gradientClamp = 1.0}
 
-         --this evaluates the derivative of the 'learn function.' Currently it is failing. 
-         local testLoss2, dMetaParams = dLearn({learningRate = lr})
-         tester:assert(testLoss1 == testLoss2,"value computed using 'learn' function does not match value computed by 'dLearn'")
+      --whether to project the learned hyperparameter value onto R+
+      local doProjection = {lambda = true,learningRate = true}
+
+      --initial values for the hyperparams to be optimized
+      local hyperParams = {learningRate = 0.01, lambda = 0.01, gamma = 0.9}
+
+      --projection onto R+
+      local function project(t) 
+              return math.max(0,t)
+      end
+
+      local function sign(x)
+         if(x > 0) then  return 1 else return -1 end
+      end
+
+      local function hyperParamGradientUpdate(hyperHyperParams,hyperParams,dHyperParams)
+         for _,k in ipairs(hyperParamsToUpdate) do
+            --gradient clipping
+            if(math.abs(dHyperParams[k]) > hyperHyperParams.gradientClamp) then dHyperParams[k] = sign(dHyperParams[k])*hyperHyperParams.gradientClamp end
+               
+            --gradient step (with fixed learning rate)
+            hyperParams[k] = hyperParams[k] - hyperHyperParams.learningRate*dHyperParams[k]
+
+            --projection
+            if(doProjection[k]) then hyperParams[k] = project(hyperParams[k]) end
+         end
+      end
+
+      --learn the hyperparameters with gradient descent!
+      for t = 1,25 do
+           local dHyperParams, testLoss = dLearn(hyperParams, trainingSet, testSet)
+           --print(string.format("lr = %10f, lambda = %10f: %10f",hyperParams.learningRate,hyperParams.lambda,testLoss))
+           hyperParamGradientUpdate(hyperHyperParams,hyperParams,dHyperParams)
       end
    end
 
